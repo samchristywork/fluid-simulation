@@ -50,5 +50,333 @@
   <div id="info">click & drag to add fluid · mouse movement adds velocity</div>
   <button id="recordBtn">&#9679; Record GIF</button>
 </div>
+
+<script src="https://unpkg.com/gif.js@0.2.0/dist/gif.js"></script>
+<script>
+const N      = 128;
+const SCALE  = 5;
+const ITER   = 16;
+const DT     = 0.12;
+const DIFF   = 0.000002;
+const VISC   = 0.000001;
+
+const W = N + 2;
+const SIZE = W * W;
+
+const IX = (i, j) => i + W * j;
+
+let u    = new Float32Array(SIZE);
+let v    = new Float32Array(SIZE);
+let uPrv = new Float32Array(SIZE);
+let vPrv = new Float32Array(SIZE);
+let dens    = new Float32Array(SIZE);
+let densPrv = new Float32Array(SIZE);
+
+const solid = new Uint8Array(SIZE);
+
+const RECTS = [
+  [48,  8, 58, 18],
+  [78, 52, 90, 96],
+  [36, 86, 72, 96],
+  [95, 20, 105, 60],
+];
+
+function buildObstacles() {
+  for (const [x1, y1, x2, y2] of RECTS) {
+    for (let j = y1; j <= y2; j++)
+      for (let i = x1; i <= x2; i++)
+        solid[IX(i, j)] = 1;
+  }
+}
+
+function setBnd(b, x) {
+  for (let k = 1; k <= N; k++) {
+    x[IX(0,   k)] = b === 1 ? -x[IX(1, k)] : x[IX(1, k)];
+    x[IX(N+1, k)] = b === 1 ? -x[IX(N, k)] : x[IX(N, k)];
+    x[IX(k,   0)] = b === 2 ? -x[IX(k, 1)] : x[IX(k, 1)];
+    x[IX(k, N+1)] = b === 2 ? -x[IX(k, N)] : x[IX(k, N)];
+  }
+  x[IX(0,   0  )] = 0.5 * (x[IX(1, 0  )] + x[IX(0,   1)]);
+  x[IX(0,   N+1)] = 0.5 * (x[IX(1, N+1)] + x[IX(0,   N)]);
+  x[IX(N+1, 0  )] = 0.5 * (x[IX(N, 0  )] + x[IX(N+1, 1)]);
+  x[IX(N+1, N+1)] = 0.5 * (x[IX(N, N+1)] + x[IX(N+1, N)]);
+
+  for (let j = 1; j <= N; j++)
+    for (let i = 1; i <= N; i++)
+      if (solid[IX(i, j)]) x[IX(i, j)] = 0;
+}
+
+function linSolve(b, x, x0, a, c) {
+  const cInv = 1 / c;
+  for (let iter = 0; iter < ITER; iter++) {
+    for (let j = 1; j <= N; j++) {
+      for (let i = 1; i <= N; i++) {
+        if (solid[IX(i, j)]) continue;
+        const r  = solid[IX(i+1,j)] ? 0 : x[IX(i+1,j)];
+        const l  = solid[IX(i-1,j)] ? 0 : x[IX(i-1,j)];
+        const d  = solid[IX(i,j+1)] ? 0 : x[IX(i,j+1)];
+        const u2 = solid[IX(i,j-1)] ? 0 : x[IX(i,j-1)];
+        x[IX(i,j)] = (x0[IX(i,j)] + a * (r + l + d + u2)) * cInv;
+      }
+    }
+    setBnd(b, x);
+  }
+}
+
+function diffuse(b, x, x0, diff) {
+  const a = DT * diff * N * N;
+  linSolve(b, x, x0, a, 1 + 4 * a);
+}
+
+function advect(b, d, d0, velU, velV) {
+  const dt0 = DT * N;
+  for (let j = 1; j <= N; j++) {
+    for (let i = 1; i <= N; i++) {
+      if (solid[IX(i, j)]) { d[IX(i,j)] = 0; continue; }
+
+      let x = i - dt0 * velU[IX(i,j)];
+      let y = j - dt0 * velV[IX(i,j)];
+
+      x = Math.max(0.5, Math.min(N + 0.5, x));
+      y = Math.max(0.5, Math.min(N + 0.5, y));
+
+      const i0 = Math.floor(x), i1 = i0 + 1;
+      const j0 = Math.floor(y), j1 = j0 + 1;
+      const s1 = x - i0, s0 = 1 - s1;
+      const t1 = y - j0, t0 = 1 - t1;
+
+      d[IX(i,j)] =
+        s0 * (t0 * d0[IX(i0,j0)] + t1 * d0[IX(i0,j1)]) +
+        s1 * (t0 * d0[IX(i1,j0)] + t1 * d0[IX(i1,j1)]);
+    }
+  }
+  setBnd(b, d);
+}
+
+function project(uu, vv, p, div) {
+  for (let j = 1; j <= N; j++) {
+    for (let i = 1; i <= N; i++) {
+      if (solid[IX(i,j)]) { div[IX(i,j)] = 0; p[IX(i,j)] = 0; continue; }
+
+      const uR = solid[IX(i+1,j)] ? -uu[IX(i,j)] : uu[IX(i+1,j)];
+      const uL = solid[IX(i-1,j)] ? -uu[IX(i,j)] : uu[IX(i-1,j)];
+      const vU = solid[IX(i,j+1)] ? -vv[IX(i,j)] : vv[IX(i,j+1)];
+      const vD = solid[IX(i,j-1)] ? -vv[IX(i,j)] : vv[IX(i,j-1)];
+
+      div[IX(i,j)] = -0.5 * (uR - uL + vU - vD) / N;
+      p[IX(i,j)]   = 0;
+    }
+  }
+  setBnd(0, div);
+  setBnd(0, p);
+  linSolve(0, p, div, 1, 4);
+
+  for (let j = 1; j <= N; j++) {
+    for (let i = 1; i <= N; i++) {
+      if (solid[IX(i,j)]) continue;
+      uu[IX(i,j)] -= 0.5 * N * (p[IX(i+1,j)] - p[IX(i-1,j)]);
+      vv[IX(i,j)] -= 0.5 * N * (p[IX(i,j+1)] - p[IX(i,j-1)]);
+    }
+  }
+  setBnd(1, uu);
+  setBnd(2, vv);
+}
+
+function velStep() {
+  [u, uPrv] = [uPrv, u];
+  [v, vPrv] = [vPrv, v];
+  diffuse(1, u, uPrv, VISC);
+  diffuse(2, v, vPrv, VISC);
+  project(u, v, uPrv, vPrv);
+  [u, uPrv] = [uPrv, u];
+  [v, vPrv] = [vPrv, v];
+  advect(1, u, uPrv, uPrv, vPrv);
+  advect(2, v, vPrv, uPrv, vPrv);
+  project(u, v, uPrv, vPrv);
+}
+
+function densStep() {
+  [dens, densPrv] = [densPrv, dens];
+  diffuse(0, dens, densPrv, DIFF);
+  [dens, densPrv] = [densPrv, dens];
+  advect(0, dens, densPrv, u, v);
+}
+
+function addWind() {
+  const cx = Math.round(N / 2);
+  const hw = 10;
+  for (let j = cx - hw; j <= cx + hw; j++) {
+    if (solid[IX(2, j)]) continue;
+    dens[IX(2, j)] += 0.9;
+    u   [IX(2, j)] += 4.0;
+  }
+  for (let j = cx - hw; j <= cx; j++) v[IX(2, j)] -= 0.5;
+  for (let j = cx; j <= cx + hw; j++) v[IX(2, j)] += 0.5;
+}
+
+let mouseGX = -1, mouseGY = -1, prevGX = -1, prevGY = -1;
+let mouseDown = false;
+
+const canvas = document.getElementById('canvas');
+canvas.width  = N * SCALE;
+canvas.height = N * SCALE;
+const ctx = canvas.getContext('2d');
+const imgData = ctx.createImageData(canvas.width, canvas.height);
+
+const gifCanvas = document.createElement('canvas');
+gifCanvas.width  = N;
+gifCanvas.height = N;
+const gifCtx = gifCanvas.getContext('2d');
+const gifImgData = gifCtx.createImageData(N, N);
+
+function toGrid(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return [
+    Math.floor((clientX - rect.left)  / SCALE) + 1,
+    Math.floor((clientY - rect.top)   / SCALE) + 1,
+  ];
+}
+
+canvas.addEventListener('mousedown', e => { mouseDown = true; [mouseGX, mouseGY] = toGrid(e.clientX, e.clientY); });
+canvas.addEventListener('mouseup',   () => { mouseDown = false; prevGX = prevGY = -1; });
+canvas.addEventListener('mouseleave',() => { mouseDown = false; prevGX = prevGY = -1; });
+canvas.addEventListener('mousemove', e => {
+  prevGX = mouseGX; prevGY = mouseGY;
+  [mouseGX, mouseGY] = toGrid(e.clientX, e.clientY);
+  if (mouseDown) applyMouse();
+});
+canvas.addEventListener('mousedown', applyMouse);
+
+function applyMouse() {
+  if (mouseGX < 1 || mouseGX > N || mouseGY < 1 || mouseGY > N) return;
+  if (solid[IX(mouseGX, mouseGY)]) return;
+  dens[IX(mouseGX, mouseGY)] += 1.0;
+  if (prevGX > 0) {
+    u[IX(mouseGX, mouseGY)] += (mouseGX - prevGX) * 8;
+    v[IX(mouseGX, mouseGY)] += (mouseGY - prevGY) * 8;
+  }
+}
+
+function densityColor(d) {
+  d = Math.min(1, d);
+  let r, g, b;
+  if (d < 0.33) {
+    const t = d / 0.33;
+    r = Math.round(t * 220);
+    g = 0;
+    b = Math.round(t * 30);
+  } else if (d < 0.66) {
+    const t = (d - 0.33) / 0.33;
+    r = Math.round(220 + t * 35);
+    g = Math.round(t * 200);
+    b = Math.round(30 * (1 - t));
+  } else {
+    const t = (d - 0.66) / 0.34;
+    r = 255;
+    g = Math.round(200 + t * 55);
+    b = Math.round(t * 255);
+  }
+  return [r, g, b];
+}
+
+function render() {
+  const data = imgData.data;
+  const gdata = gifImgData.data;
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const idx = IX(i + 1, j + 1);
+      let r, g, b;
+      if (solid[idx]) {
+        r = 70; g = 75; b = 85;
+      } else {
+        [r, g, b] = densityColor(dens[idx]);
+      }
+      const basePixel = (j * SCALE * canvas.width + i * SCALE) * 4;
+      for (let dy = 0; dy < SCALE; dy++) {
+        for (let dx = 0; dx < SCALE; dx++) {
+          const px = basePixel + (dy * canvas.width + dx) * 4;
+          data[px]     = r;
+          data[px + 1] = g;
+          data[px + 2] = b;
+          data[px + 3] = 255;
+        }
+      }
+      const gp = (j * N + i) * 4;
+      gdata[gp]     = r;
+      gdata[gp + 1] = g;
+      gdata[gp + 2] = b;
+      gdata[gp + 3] = 255;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+  if (recording) gifCtx.putImageData(gifImgData, 0, 0);
+
+  ctx.strokeStyle = 'rgba(180,190,210,0.5)';
+  ctx.lineWidth = 1;
+  for (const [x1, y1, x2, y2] of RECTS) {
+    ctx.strokeRect(
+      (x1 - 1) * SCALE, (y1 - 1) * SCALE,
+      (x2 - x1 + 1) * SCALE, (y2 - y1 + 1) * SCALE
+    );
+  }
+}
+
+let recording = false;
+let gif = null;
+let frameCount = 0;
+let workerScript = null;
+
+fetch('https://unpkg.com/gif.js@0.2.0/dist/gif.worker.js')
+  .then(r => r.blob())
+  .then(b => { workerScript = URL.createObjectURL(b); });
+
+const recordBtn = document.getElementById('recordBtn');
+recordBtn.addEventListener('click', () => {
+  if (!recording) {
+    gif = new GIF({
+      workers: 2,
+      quality: 10,
+      width: N,
+      height: N,
+      workerScript,
+    });
+    gif.on('finished', blob => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'fluid.gif';
+      a.click();
+      URL.revokeObjectURL(url);
+      recordBtn.textContent = '\u25cf Record GIF';
+      recordBtn.disabled = false;
+    });
+    frameCount = 0;
+    recording = true;
+    recordBtn.textContent = '\u25a0 Stop & Save GIF';
+    recordBtn.classList.add('recording');
+  } else {
+    recording = false;
+    recordBtn.classList.remove('recording');
+    recordBtn.textContent = 'Encoding\u2026';
+    recordBtn.disabled = true;
+    gif.render();
+  }
+});
+
+function tick() {
+  addWind();
+  velStep();
+  densStep();
+  render();
+  if (recording) {
+    gif.addFrame(gifCanvas, { copy: true, delay: 33 });
+  }
+  frameCount++;
+  requestAnimationFrame(tick);
+}
+
+buildObstacles();
+tick();
+</script>
 </body>
 </html>
